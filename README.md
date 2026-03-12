@@ -31,21 +31,32 @@ From the parent repo:
 
 ```bash
 make -C pmoves up-n8n
+make -C pmoves n8n-api-bootstrap
 make -C pmoves n8n-import-flows
 make -C pmoves n8n-activate-flows
+make -C pmoves n8n-sync-supabase-registry
+make -C pmoves n8n-bootstrap
 ```
 
 Directly from this submodule:
 
 ```bash
+python scripts/bootstrap_n8n_api.py --write-env ../pmoves/.env.local
 python scripts/import_repo_flows.py --container pmoves-n8n --workflow-dir workflows
 python scripts/import_repo_flows.py --container pmoves-n8n --workflow-dir workflows --activate-only
+python scripts/sync_supabase_registry.py --workflow-dir workflows
 python scripts/export_repo_flows.py --container pmoves-n8n --workflow-dir workflows
 ```
 
 ## Public API note
 
-The n8n 2.x Public API requires a valid API key created in the n8n UI. If `N8N_API_KEY` is present and valid, the import tool performs API-based updates. Without a valid key it falls back to CLI import for missing workflows and CLI publish/unpublish for activation.
+The n8n 2.x Public API is the production control plane for this fork lane.
+
+- `scripts/bootstrap_n8n_api.py` creates or logs into the owner account and mints a fresh API key.
+- `scripts/import_repo_flows.py` uses the Public API for workflow upserts and activation when `N8N_API_KEY` is valid.
+- `scripts/sync_supabase_registry.py` mirrors live workflow state into `pmoves_core.n8n_workflow_registry` so PMOVES can track workflow status in Supabase.
+
+The CLI import path remains only as a legacy fallback when no valid API key is available.
 
 ## License
 

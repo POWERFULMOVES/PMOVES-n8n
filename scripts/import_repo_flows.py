@@ -17,9 +17,12 @@ from typing import Any
 
 from n8n_flow_normalize import _as_workflow_obj
 
-OPTIONAL_VOICE_FILENAMES = {
+DEFAULT_INACTIVE_FILENAMES = {
     "discord_voice_agent.json",
     "telegram_voice_agent.json",
+    "finance_firefly_sync.json",
+    "finance_monthly_to_cgp.json",
+    "health_weekly_to_cgp.json",
 }
 
 
@@ -71,6 +74,42 @@ def api_request(base_url: str, api_key: str, method: str, path: str, payload: di
         return json.loads(content) if content else None
 
 
+def activate_workflows_via_api(
+    base_url: str,
+    api_key: str,
+    api_workflows: dict[str, dict[str, Any]],
+    local_workflows: list[dict[str, Any]],
+    enable_voice_platforms: bool,
+) -> list[str]:
+    failures: list[str] = []
+    for workflow in local_workflows:
+        name = workflow["name"]
+        remote = api_workflows.get(name)
+        if not remote:
+            failures.append(name)
+            print(f"warning: workflow missing from API list during activation: {name}")
+            continue
+        workflow_id = remote["id"]
+        filename = workflow["_filename"]
+        should_publish = enable_voice_platforms or filename not in DEFAULT_INACTIVE_FILENAMES
+        try:
+            if should_publish:
+                payload: dict[str, Any] = {}
+                version_id = remote.get("versionId")
+                if version_id:
+                    payload["versionId"] = version_id
+                api_request(base_url, api_key, "POST", f"/workflows/{workflow_id}/activate", payload)
+                state = "published"
+            else:
+                api_request(base_url, api_key, "POST", f"/workflows/{workflow_id}/deactivate", {})
+                state = "unpublished"
+            print(f"{state}: {name} ({workflow_id})")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+            failures.append(f"{name} ({workflow_id})")
+            print(f"warning: API activation failed for {name} ({workflow_id}): {exc}")
+    return failures
+
+
 def try_list_via_api(base_url: str, api_key: str) -> dict[str, dict[str, Any]] | None:
     if not api_key:
         return None
@@ -89,21 +128,16 @@ def create_payload(local_workflow: dict[str, Any]) -> dict[str, Any]:
         "connections": local_workflow["connections"],
         "settings": local_workflow.get("settings") or {},
         "staticData": local_workflow.get("staticData"),
-        "active": False,
     }
 
 
 def update_payload(local_workflow: dict[str, Any], remote_workflow: dict[str, Any]) -> dict[str, Any]:
     return {
-        "id": remote_workflow["id"],
-        "versionId": remote_workflow["versionId"],
         "name": local_workflow["name"],
         "nodes": local_workflow["nodes"],
         "connections": local_workflow["connections"],
         "settings": local_workflow.get("settings") or {},
         "staticData": local_workflow.get("staticData"),
-        "active": bool(remote_workflow.get("active", False)),
-        "tags": remote_workflow.get("tags") or [],
     }
 
 
@@ -121,7 +155,7 @@ def activate_workflows(
             continue
         workflow_id = remote["id"]
         filename = workflow["_filename"]
-        should_publish = enable_voice_platforms or filename not in OPTIONAL_VOICE_FILENAMES
+        should_publish = enable_voice_platforms or filename not in DEFAULT_INACTIVE_FILENAMES
         command = "publish:workflow" if should_publish else "unpublish:workflow"
         try:
             docker_exec(container, "n8n", command, f"--id={workflow_id}")
@@ -145,15 +179,16 @@ def main() -> int:
     parser.add_argument("--container-workflow-dir", default="/flows")
     parser.add_argument("--n8n-api-url", default=os.environ.get("N8N_API_URL", "http://localhost:5678/api/v1"))
     parser.add_argument("--activate-only", action="store_true")
+    parser.add_argument("--skip-activation", action="store_true")
     parser.add_argument("--voice-platforms", action="store_true")
     args = parser.parse_args()
 
     local_workflows = load_local_workflows(args.workflow_dir)
     cli_workflows = parse_cli_workflows(docker_exec(args.container, "n8n", "list:workflow").stdout)
+    api_key = os.environ.get("N8N_API_KEY", "")
+    api_workflows = try_list_via_api(args.n8n_api_url, api_key) if api_key else None
 
     if not args.activate_only:
-        api_key = os.environ.get("N8N_API_KEY", "")
-        api_workflows = try_list_via_api(args.n8n_api_url, api_key)
         if api_workflows is not None:
             print("Using n8n Public API for workflow upserts.")
             for workflow in local_workflows:
@@ -168,6 +203,7 @@ def main() -> int:
                     created_id = created.get("id", "unknown") if isinstance(created, dict) else "unknown"
                     print(f"created: {workflow['name']} ({created_id})")
             cli_workflows = parse_cli_workflows(docker_exec(args.container, "n8n", "list:workflow").stdout)
+            api_workflows = try_list_via_api(args.n8n_api_url, api_key)
         else:
             print("No valid N8N_API_KEY detected. Falling back to CLI import for missing workflows.")
             import_failures: list[str] = []
@@ -186,9 +222,24 @@ def main() -> int:
             if import_failures:
                 print("warning: some workflow imports failed via CLI; use a valid N8N_API_KEY for in-place upserts or clean the local n8n DB before retrying.")
 
-    activation_failures = activate_workflows(args.container, cli_workflows, local_workflows, args.voice_platforms)
+    if args.skip_activation:
+        return 0
+
+    if api_workflows is not None:
+        activation_failures = activate_workflows_via_api(
+            args.n8n_api_url,
+            api_key,
+            api_workflows,
+            local_workflows,
+            args.voice_platforms,
+        )
+    else:
+        activation_failures = activate_workflows(args.container, cli_workflows, local_workflows, args.voice_platforms)
     if activation_failures:
-        print("warning: some workflows could not be toggled because the local n8n DB has legacy/broken version records.")
+        if api_workflows is not None:
+            print("warning: some workflows could not be toggled via the n8n Public API.")
+        else:
+            print("warning: some workflows could not be toggled because the local n8n DB has legacy/broken version records.")
     return 0
 
 
