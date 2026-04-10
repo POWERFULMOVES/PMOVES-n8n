@@ -205,7 +205,11 @@ def main() -> int:
             cli_workflows = parse_cli_workflows(docker_exec(args.container, "n8n", "list:workflow").stdout)
             api_workflows = try_list_via_api(args.n8n_api_url, api_key)
         else:
-            print("No valid N8N_API_KEY detected. Falling back to CLI import for missing workflows.")
+            sys.stderr.write(
+                "\n[WARNING] No valid N8N_API_KEY detected — falling back to CLI import.\n"
+                "  CLI import cannot update existing workflows (only create new ones).\n"
+                "  To enable full upsert: run 'make -C pmoves n8n-bootstrap' first.\n\n"
+            )
             import_failures: list[str] = []
             for workflow in local_workflows:
                 if workflow["name"] in cli_workflows:

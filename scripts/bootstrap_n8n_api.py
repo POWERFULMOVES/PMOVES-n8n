@@ -96,6 +96,36 @@ def collect_api_keys(keys_payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _read_env_file_value(path: Path, key: str) -> str:
+    """Read a single value from an env file (KEY=value format)."""
+    if not path.exists():
+        return ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def _wait_for_n8n(base_url: str, timeout: int = 120) -> None:
+    """Wait for n8n to be ready, polling /healthz every 2 seconds."""
+    import time
+
+    health_url = f"{base_url}/healthz"
+    print(f"waiting for n8n at {health_url} (timeout={timeout}s)...")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            req = urllib.request.Request(health_url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    print("n8n is ready")
+                    return
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(2)
+    raise RuntimeError(f"n8n did not become ready within {timeout}s at {health_url}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bootstrap an n8n owner account and Public API key.")
     parser.add_argument("--base-url", default=load_env_value("N8N_BASE_URL") or "http://localhost:5678")
@@ -106,10 +136,16 @@ def main() -> int:
     parser.add_argument("--password", default=load_env_value("N8N_OWNER_PASSWORD"))
     parser.add_argument("--label", default=load_env_value("N8N_API_KEY_LABEL") or "PMOVES.AI automation bootstrap")
     parser.add_argument("--write-env", action="append", default=[])
+    parser.add_argument("--wait-timeout", type=int, default=120,
+                        help="Seconds to wait for n8n /healthz before giving up (default: 120)")
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     api_url = args.api_url.rstrip("/")
+
+    # --- P0 FIX: Wait for n8n to be healthy before any API calls ---
+    _wait_for_n8n(base_url, timeout=args.wait_timeout)
+
     cookie_jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
 
@@ -120,10 +156,27 @@ def main() -> int:
     needs_owner_setup = bool(user_management.get("showSetupOnFirstLoad"))
 
     password = args.password
+
+    # --- P0 FIX: If no password supplied and owner already exists, try reading
+    # from the env files written by a previous bootstrap run. This prevents the
+    # 401 mismatch where a NEW random password is generated but the owner was
+    # created with the OLD one.
+    if not password and not needs_owner_setup:
+        for env_path in env_paths:
+            saved_pw = _read_env_file_value(env_path, "N8N_OWNER_PASSWORD")
+            if saved_pw:
+                password = saved_pw
+                print(f"recovered owner password from {env_path}")
+                break
+
     if needs_owner_setup and not password:
         password = random_password()
     if not password:
-        raise RuntimeError("N8N_OWNER_PASSWORD is required once the n8n owner account already exists")
+        raise RuntimeError(
+            "N8N_OWNER_PASSWORD is required once the n8n owner account already exists. "
+            "Set it in your env or pass --password. Check .env.local or env.shared "
+            "for the password written during first bootstrap."
+        )
 
     env_paths = [Path(env_path) for env_path in args.write_env]
     base_env_pairs = {
@@ -147,7 +200,22 @@ def main() -> int:
             "emailOrLdapLoginId": args.email,
             "password": password,
         }
-        request_json(opener, "POST", f"{base_url}/rest/login", payload)
+        try:
+            request_json(opener, "POST", f"{base_url}/rest/login", payload)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                sys.stderr.write(
+                    f"\n401 LOGIN FAILED for {args.email}\n"
+                    f"  The owner account exists but the password doesn't match.\n"
+                    f"  This usually means the password was generated on first bootstrap\n"
+                    f"  and saved to .env.local, but the env file was lost or regenerated.\n\n"
+                    f"  Recovery options:\n"
+                    f"  1. Set N8N_OWNER_PASSWORD=<original_password> in your env\n"
+                    f"  2. Check .env.local or pmoves/env.shared for the saved password\n"
+                    f"  3. Reset n8n data: make -C pmoves volume-reset SERVICE=n8n\n"
+                    f"     (WARNING: this deletes all n8n workflows and settings)\n\n"
+                )
+            raise
         print(f"logged in owner: {args.email}")
 
     for path in env_paths:
