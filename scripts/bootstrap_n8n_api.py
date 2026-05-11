@@ -72,6 +72,11 @@ def upsert_env(path: Path, pairs: dict[str, str]) -> None:
         if key in remaining:
             updated.append(f"{key}={pairs[key]}")
     path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
+    # Restrict permissions to owner-read/write only (secrets file)
+    try:
+        path.chmod(0o600)
+    except NotImplementedError:
+        pass  # chmod is a no-op on Windows
 
 
 def collect_scopes(scopes_payload: Any) -> list[str]:

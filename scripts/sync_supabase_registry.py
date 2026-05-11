@@ -6,12 +6,37 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+# Allowlist for SSRF guard — only local loopback addresses are valid targets
+_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# Allowlist regex for Postgres schema names
+_SCHEMA_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _validate_local_url(url: str, name: str) -> None:
+    """Reject any URL that does not target a local loopback address."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in _ALLOWED_HOSTS:
+        raise ValueError(
+            f"{name} must target a local address (localhost / 127.0.0.1); "
+            f"got host '{host}' in '{url}'"
+        )
+
+
+def _validate_schema(schema: str) -> None:
+    """Reject schema names that don't match a safe Postgres identifier pattern."""
+    if not _SCHEMA_RE.match(schema):
+        raise ValueError(
+            f"--supabase-schema must match ^[a-zA-Z_][a-zA-Z0-9_]*$; got '{schema}'"
+        )
 
 
 DEFAULT_INACTIVE_FILENAMES = {
@@ -176,6 +201,13 @@ def main() -> int:
     parser.add_argument("--supabase-schema", default=os.environ.get("SUPABASE_PROFILE") or "pmoves_core")
     parser.add_argument("--db-container", default=os.environ.get("SUPABASE_DB_CONTAINER", ""))
     args = parser.parse_args()
+
+    # Security: validate URLs target only local loopback addresses (SSRF guard)
+    _validate_local_url(args.n8n_api_url, "--n8n-api-url")
+    _validate_local_url(args.supabase_rest_url, "--supabase-rest-url")
+
+    # Security: validate schema is a safe Postgres identifier (injection guard)
+    _validate_schema(args.supabase_schema)
 
     n8n_api_key = os.environ.get("N8N_API_KEY", "").strip()
     if not n8n_api_key:
